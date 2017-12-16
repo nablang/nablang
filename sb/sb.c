@@ -1,8 +1,10 @@
 #include "sb.h"
+#include "compile.h"
 #include <stdlib.h>
 #include <adt/utils/dbg.h>
 #include <adt/utils/utf-8.h>
 #include <adt/dict.h>
+#include <adt/sym-table.h>
 
 static uint32_t _hex_to_uint(char c) {
   if (c >= '0' && c <= '9') {
@@ -120,8 +122,19 @@ static ValPair token(Spellbreak* ctx, int32_t argc, Val* argv) {
   return (ValPair){VAL_NIL, VAL_NIL};
 }
 
-static ValPair yield(Spellbreak* ctx, Val obj) {
-  // todo
+static ValPair yield(Spellbreak* sb, Val obj) {
+  int context_stack_size = ContextStack.size(&sb->context_stack);
+  assert(context_stack_size > 0);
+  ContextEntry* entry = ContextStack.at(&sb->context_stack, context_stack_size - 1);
+  Token tok = {
+    .pos = entry->s - sb->s,
+    .size = sb->curr - entry->s,
+    .v = obj,
+    .ty = entry->name_str
+  };
+  assert(sb->token_stream.size >= entry->token_pos);
+  sb->token_stream.size = entry->token_pos;
+  TokenStream.push(&sb->token_stream, tok);
   return (ValPair){VAL_NIL, VAL_NIL};
 }
 
@@ -145,7 +158,6 @@ static void _sb_destruct(void* p) {
   Spellbreak* sb = p;
   Vals.cleanup(&sb->stack);
   ContextStack.cleanup(&sb->context_stack);
-  Vals.cleanup(&sb->vars);
   TokenStream.cleanup(&sb->token_stream);
 }
 
@@ -154,7 +166,7 @@ static void _sb_destruct(void* p) {
 #define STR(v) nb_string_new_literal_c(v)
 
 void sb_init_module(void) {
-  spellbreak_klass = sb_new_syntax(STR("Spellbreak"));
+  spellbreak_klass = sb_syntax_new(STR("Spellbreak"));
 
 # define DEF_NODE(type, ...) _define_node(#type, sizeof((const char*[]){__VA_ARGS__}) / sizeof(const char*), (const char*[]){__VA_ARGS__})
 # include "sb-klasses.inc"
@@ -172,7 +184,7 @@ void sb_bootstrap() {
   val_gens_set_current(gen);
 
   Val ast = sb_bootstrap_ast(spellbreak_klass);
-  sb_syntax_compile(spellbreak_klass, ast);
+  sb_syntax_generate(ast, spellbreak_klass);
 
   val_gens_set_current(gen - 1);
   val_gens_drop();
@@ -182,11 +194,11 @@ uint32_t sb_klass() {
   return spellbreak_klass;
 }
 
-uint32_t sb_new_syntax(uint32_t name_str) {
-  uint32_t klass = klass_ensure(name_str, klass_ensure(STR("Lang"), 0));
-  SpellbreakMData* mdata = malloc(sizeof(SpellbreakMData));
-  mdata->compiled = false;
-  klass_set_data(klass, mdata);
+uint32_t sb_syntax_new(uint32_t name_str) {
+  uint32_t klass = klass_def(name_str, klass_def(STR("Lang"), 0));
+  SpellbreakKlassData* klass_data = malloc(sizeof(SpellbreakKlassData));
+  klass_data->compiled = false;
+  klass_set_data(klass, klass_data);
   klass_set_destruct_func(klass, _sb_destruct);
 
   METHOD(klass, peg, 1);
@@ -203,23 +215,24 @@ uint32_t sb_new_syntax(uint32_t name_str) {
 #undef METHOD
 
 Spellbreak* sb_new(uint32_t syntax_klass) {
-  SpellbreakMData* mdata = klass_get_data(syntax_klass);
+  SpellbreakKlassData* klass_data = klass_get_data(syntax_klass);
 
-  if (!mdata->compiled) {
+  if (!klass_data->compiled) {
     val_throw(STR("klass not compiled"));
   }
 
-  Spellbreak* s = val_alloc(syntax_klass, sizeof(Spellbreak));
+  int global_vars_size = VarsTable.size(&klass_data->symbols->global_vars);
+  Spellbreak* s = val_alloc(syntax_klass, sizeof(Spellbreak) + global_vars_size * sizeof(Val));
+  s->global_vars_size = global_vars_size;
 
-  s->context_dict = mdata->context_dict;
+  s->context_dict = klass_data->context_dict;
 
   Vals.init(&s->stack, 10);
   ContextStack.init(&s->context_stack, 5);
   TokenStream.init(&s->token_stream, 20);
-  Vals.init(&s->vars, mdata->vars_size);
 
-  for (int i = 0; i < mdata->vars_size; i++) {
-    Vals.at(&s->vars, i)[0] = VAL_NIL;
+  for (int i = 0; i < global_vars_size; i++) {
+    s->global_vars[i] = VAL_NIL;
   }
 
   return s;
@@ -229,14 +242,10 @@ void sb_reset(Spellbreak* s) {
   s->stack.size = 0;
   s->context_stack.size = 0;
   s->token_stream.size = 0;
-  for (int i = 0; i < Vals.size(&s->vars); i++) {
-    Vals.at(&s->vars, i)[0] = VAL_NIL;
+  for (int i = 0; i < Vals.size(&s->stack); i++) {
+    Vals.at(&s->stack, i)[0] = VAL_NIL;
   }
   s->curr = s->s;
-}
-
-Spellbreak* sb_new_sb() {
-  return sb_new(spellbreak_klass);
 }
 
 Val sb_parse(Spellbreak* s, const char* src, int64_t size) {
@@ -250,27 +259,29 @@ Val sb_parse(Spellbreak* s, const char* src, int64_t size) {
   return pair.fst;
 }
 
-void sb_syntax_compile(Val ast, uint32_t target_klass) {
-  CompileCtx ctx = {
+void sb_syntax_generate(Val ast, uint32_t target_klass) {
+  Symbols* symbols = SYMBOLS_NEW();
+  Compiler compiler = {
     .context_dict = nb_dict_new(),
     .patterns_dict = nb_dict_new(),
-    .vars_dict = nb_dict_new(),
-    .ast = ast
+    .symbols = symbols,
+    .ast = ast,
+    .namespace_id = target_klass
   };
-  Iseq.init(&ctx.iseq, 30);
-  Val err = sb_compile_main(&ctx);
+  Iseq.init(&compiler.iseq, 30);
+  Val err = sb_compile_main(&compiler);
 
   if (err != VAL_UNDEF) {
-    RELEASE(ctx.context_dict);
-    RELEASE(ctx.patterns_dict);
-    RELEASE(ctx.vars_dict);
+    RELEASE(compiler.context_dict);
+    RELEASE(compiler.patterns_dict);
+    SYMBOLS_DELETE(symbols);
     val_throw(err);
   }
 
-  SpellbreakMData* mdata = klass_get_data(target_klass);
-  mdata->context_dict = ctx.context_dict;
-  mdata->vars_size = nb_dict_size(ctx.vars_dict);
+  SpellbreakKlassData* mdata = klass_get_data(target_klass);
+  mdata->context_dict = compiler.context_dict;
   mdata->compiled = true;
-  RELEASE(ctx.patterns_dict);
-  RELEASE(ctx.vars_dict);
+
+  RELEASE(compiler.patterns_dict);
+  // TODO can we reduce runtime memory usage by deleting symbols?
 }

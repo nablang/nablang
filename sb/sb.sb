@@ -2,17 +2,9 @@
 
 # pre-process: replace tabs with '  ', replace "\r\n" with "\n"
 
-# we need an ST representation that can be restored to code, so:
-# - some tokens are for css styling only
-# - eol is a token which may contain comment and space before comment
-# - spaces before a action/eql-sign should be kept
-# - spaces in regexp gets special treatment
-
 # for bootstrap, this file uses only the minimal subset of spellbreak
-# - calls with optional params are filled with concrete params
 # - no use of `\u`, `\x` and `{n}` in regexp
-# - no use nested regexp
-# - special chars inside `[]` are escaped
+# - special chars inside `[]` are all escaped
 # - no use if/infix in callbacks
 # - all `#` in regexp or string are escaped
 # - all structs are defined in one-line
@@ -45,7 +37,7 @@ lex Main[
 struct Main[ins]
 struct PatternIns[name, pattern]
 struct StructIns[name, args]
-struct VarDecl[var_name]
+struct GlobalVarDecl[var_name]
 struct Lex[context, rules]
 struct Peg[context, rules]
 peg Main[
@@ -54,7 +46,7 @@ peg Main[
   Line : space.eol { } / Ins { $1 }
 
   Ins : kw.pattern name.pattern space.pre-eq op.eq Pattern { PatternIns[$2, $5] }
-      / kw.var name.var.global { VarDecl[$2] }
+      / kw.var name.var.global { GlobalVarDecl[$2] }
       / kw.struct name.struct name.arg* { StructIns[$2, $3] }
       / kw.lex name.context Lex { Lex[$2, $3] }
       / kw.peg name.context Peg { Peg[$2, $3] }
@@ -82,7 +74,6 @@ lex Lex[
   /\*[A-Z]\w*/ { :token "name.context.partial" }
   /[A-Z]\w*/   { :token "name.context" }
   /[a-z]\w*/   { :token "name.var" }
-  /$[a-z]\w*/  { :token "name.var.global" }
 
   *Spaces
 ]
@@ -93,6 +84,7 @@ struct SeqLexRules[rules]
 struct BeginCallback[first_cb, rules]
 struct EndCallback[first_cb, rules]
 struct LexRule[pattern, code]
+struct VarDecl[var_name]
 struct VarRef[var_name]
 struct GlobalVarRef[name]
 peg Lex[
@@ -101,7 +93,7 @@ peg Lex[
            / name.context { RefContext[$1] }
            / Rule+ { SeqLexRules[$1] }
            / kw.begin Callback? Rule+ { BeginCallback[$2, $3] }
-           / kw.end Callback Rule+ { EndCallback[$2, $3] }
+           / kw.end Callback? Rule+ { EndCallback[$2, $3] }
            / space.eol { }
   Rule : Pattern space.pre-callback* Callback? { LexRule[$1, $3] }
   Pattern : String { $1 }
@@ -198,14 +190,14 @@ lex PureCallback[
 
 lex Callback[
   *PureCallback
-  /var\b/      { :token "kw.var" }
-  /\$[a-z]\w*/ { :token "name.var.global" }
-  /[a-z]\w*/   { :token "name.var" }
+  /var\b/      { :token "kw.var" } /[a-z]\w*/
+  /\$[a-z]\w*/ { :token "name.var.global" 0 }
+  /[a-z]\w*/   { :token "name.var" 0 }
   /:[\w+\-*\/^&|<>=!%@]+/ { :token "name.func" }
   "=" { :token "op.eq" }
 ]
 
-# defined above: VarDecl VarRef
+# defined above: VarRef
 struct Callback[stmts] # stmts reversed
 struct InfixLogic[lhs, op, rhs]
 struct Call[func_name, argv] # argv reversed
@@ -213,12 +205,13 @@ struct Capture[var_name]
 struct CreateNode[ty, elems] # elems reversed
 struct CreateList[elems] # elems reversed
 struct Assign[var_name, expr]
+struct GlobalAssign[var_name, expr]
 struct SplatEntry[expr]
 struct If[expr, true_clause, false_clause] # lines reversed, false_clause can be If
 peg Callback[
   Callback : begin.code Stmts end.code { Callback[$2] }
   Stmts : Expr Stmts { [$1, *$2] }
-        / kw.var name.var Stmts { VarDecl[$2] }
+        / kw.var name.var Stmts { [VarDecl[$2], *$3] } # only allowed in begin block
         / space.eol Stmts { $2 }
         / EPSILON { }
   Expr : Infix.Logic { $1 }
@@ -247,8 +240,9 @@ peg Callback[
        / begin.list Entries end.list { CreateList[$2] }
        / name.func Expr* { Call[$1, $2] }
        / name.var space.pre-eq op.eq Expr { Assign[$1, $4] }
+       / name.var.global space.pre-eq op.eq Expr { GlobalAssign[$1, $4] }
        / name.var { VarRef[$1] }
-       / name.var.global { VarRef[$1] }
+       / name.var.global { GlobalVarRef[$1] }
        / If { $1 }
 
   Entries : Expr Entries { [$1, *$2] }

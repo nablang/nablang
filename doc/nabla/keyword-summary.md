@@ -16,12 +16,13 @@
 
 the following words can not be used as variables, but can be used as method names.
 
-declarative (10)
+declarative (9)
 
-    struct class
+    class
     include scope def
     undef final local var
-    import
+    require
+    typedef
 
 type checker (1)
 
@@ -31,12 +32,13 @@ logic shortcut operator (4)
 
     not and or xor
 
-control flow (10)
+control flow (11)
 
     if else case
     when ensure end
     while wend
     make pick
+    goto
 
 jumps (3)
 

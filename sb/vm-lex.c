@@ -2,24 +2,20 @@
 #include "vm-lex-op-codes.h"
 
 // vm for lex and callback (not for peg's callback)
+// it organizes nearly everything (sb_parse just invokes sb_vm_lex_exec)
+// the bytecode is a linearlized stream, so the impact of page fault is minimized.
+// the execution shares stack so allocation is minimized too.
+
+// for vm stack and captures, see sb.h for struct Spellbreak
 
 ValPair sb_vm_lex_exec(Spellbreak* sb) {
   static const void* labels[] = {
-    [PUSH] = &&label_PUSH,
-    [POP] = &&label_POP,
-    [LOAD] = &&label_LOAD,
-    [STORE] = &&label_STORE,
-    [CALL] = &&label_CALL,
-    [NODE] = &&label_NODE,
-    [LIST] = &&label_LIST,
-    [LISTV] = &&label_LISTV,
-    [JIF] = &&label_JIF,
-    [JMP] = &&label_JMP,
     [MATCH_RE] = &&label_MATCH_RE,
     [MATCH_STR] = &&label_MATCH_STR,
+    [CALLBACK] = &&label_CALLBACK,
     [CTX_CALL] = &&label_CTX_CALL,
-    [END] = &&label_END,
-    [NOP] = &&label_NOP
+    [CTX_END] = &&label_CTX_END,
+    [JMP] = &&label_JMP
   };
 
   bool matched;
@@ -27,7 +23,7 @@ ValPair sb_vm_lex_exec(Spellbreak* sb) {
   Val err;
 
 # define DISPATCH goto *labels[*pc]
-# define CASE(l) label_##l: case l
+# define CASE(l) label_##l: case l:
 # define STACK_PUSH(v) Vals.push(&sb->stack, (v))
 # define STACK_POP() Vals.pop(&sb->stack)
 # define STACK_TOP() Vals.at(&sb->stack, Vals.size(&sb->stack) - 1)
@@ -35,7 +31,7 @@ ValPair sb_vm_lex_exec(Spellbreak* sb) {
   ContextEntry ce = {\
     .name_str = name,\
     .token_pos = 0,\
-    .curr = sb->curr\
+    .s = sb->curr\
   };\
   int32_t offset = sb_compile_context_dict_find(sb->context_dict, name, 'l');\
   if (offset < 0) {\
@@ -54,80 +50,8 @@ begin:
     pc = Iseq.at(sb->iseq, 0);
     DISPATCH;
     switch(*pc) {
-      CASE(PUSH): {
-        STACK_PUSH(DECODE(ArgVal, pc).arg1);
-        DISPATCH;
-      }
 
-      CASE(POP): {
-        pc++;
-        STACK_POP();
-        DISPATCH;
-      }
-
-      CASE(LOAD): {
-        uint32_t i = DECODE(ArgU32, pc).arg1;
-        STACK_PUSH(*Vals.at(&sb->vars, i));
-        DISPATCH;
-      }
-
-      CASE(STORE): {
-        uint32_t i = DECODE(ArgU32, pc).arg1;
-        *Vals.at(&sb->vars, i) = STACK_POP();
-        DISPATCH;
-      }
-
-      CASE(CALL): {
-        ArgU32U32 data = DECODE(ArgU32U32, pc);
-        sb->stack.size -= data.arg1;
-        ValPair res = val_send((Val)sb, data.arg2, data.arg1, STACK_TOP());
-        if (res.snd) {
-          goto terminate;
-        } else {
-          STACK_PUSH(res.fst);
-        }
-        DISPATCH;
-      }
-
-      CASE(NODE): {
-        ArgU32U32 data = DECODE(ArgU32U32, pc);
-        sb->stack.size -= data.arg1;
-        STACK_PUSH(nb_struct_new(data.arg2, data.arg1, STACK_TOP()));
-        DISPATCH;
-      }
-
-      CASE(LIST): {
-        pc++;
-        Val tail = STACK_POP();
-        Val head = STACK_POP();
-        STACK_PUSH(nb_cons_new(head, tail));
-        DISPATCH;
-      }
-
-      CASE(LISTV): {
-        pc++;
-        Val last = STACK_POP();
-        Val init = STACK_POP();
-        STACK_PUSH(nb_cons_new_rev(init, last));
-        DISPATCH;
-      }
-
-      CASE(JIF): {
-        Val cond = STACK_POP();
-        int32_t offset = DECODE(Arg32, pc).arg1;
-        if (!VAL_IS_TRUE(cond)) {
-          pc = Iseq.at(sb->iseq, offset);
-        }
-        DISPATCH;
-      }
-
-      CASE(JMP): {
-        int32_t offset = DECODE(Arg32, pc).arg1;
-        pc = Iseq.at(sb->iseq, offset);
-        DISPATCH;
-      }
-
-      CASE(MATCH_RE): {
+      CASE(MATCH_RE) {
         // todo check eof
         Arg3232 offsets = DECODE(Arg3232, pc);
         matched = sb_vm_regexp_exec(pc, sb->s + sb->size - sb->curr, sb->curr, sb->captures);
@@ -140,7 +64,7 @@ begin:
         DISPATCH;
       }
 
-      CASE(MATCH_STR): {
+      CASE(MATCH_STR) {
         // todo check eof
         Arg3232 offsets = DECODE(Arg3232, pc);
         Val str = STACK_POP();
@@ -154,13 +78,32 @@ begin:
         DISPATCH;
       }
 
-      CASE(CTX_CALL): {
-        uint32_t ctx_name_str = DECODE(ArgU32, pc).arg1;
+      CASE(CALLBACK) {
+        pc++;
+        uint16_t captures_mask = DECODE(uint16_t, pc);
+        uint32_t next_offset = DECODE(uint32_t, pc);
+        const char* capture_start = sb->curr - sb->captures[1];
+        int32_t vars_start_index = Vals.size(&sb->stack);
+        for (int i = 0; i < 10; i++) {
+          if ((1 << i) & captures_mask) {
+            Val capture_str = nb_string_new(sb->captures[i * 2 + 1] - sb->captures[i * 2], capture_start);
+            STACK_PUSH(capture_str);
+          }
+        }
+        sb_vm_callback_exec(pc + 1, &sb->stack, sb->global_vars, vars_start_index);
+        pc += next_offset;
+        DISPATCH;
+      }
+
+      CASE(CTX_CALL) {
+        ArgU32U32 data = DECODE(ArgU32U32, pc);
+        uint32_t ctx_name_str = data.arg1;
+        uint32_t vars_size = data.arg2;
         CTX_PUSH(ctx_name_str);
         DISPATCH;
       }
 
-      CASE(END): {
+      CASE(CTX_END) {
         if (matched) {
           // todo check curr advancement
           goto begin;
@@ -175,8 +118,9 @@ begin:
         DISPATCH;
       }
 
-      CASE(NOP): {
-        pc++;
+      CASE(JMP) {
+        int32_t offset = DECODE(Arg32, pc).arg1;
+        pc = Iseq.at(sb->iseq, offset);
         DISPATCH;
       }
     }

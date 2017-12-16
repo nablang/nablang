@@ -15,7 +15,7 @@ Methods on objects
 
     obj.methods
     obj.object_id
-    obj.method m $ .call args
+    obj.:m[*args]
 
     # following methods make new objects with new methods
     obj.def! m lambda
@@ -42,7 +42,9 @@ And top level defined methods are added to `Kernel`.
     Nabla.reload
     Nabla.infix
 
-    # todo: prof, debug, tracing...
+    # todo: prof, debug, tracing... will be libraries but attached under Nabla
+
+    Nabla.languages
 
 ## Process
 
@@ -61,14 +63,21 @@ Also can have signal handlers
     IO.putc
     IO.puts
     IO.print
+    IO.open
     ...
 
-## File
+## File system and path
 
     File.cd
     File.cp
     File.entries
     File.glob
+    File.mktmp
+    File.mktmp_dir
+    File.dirname
+    File.basename
+    File.absolute_path
+    File.join
 
 ## Numeric
 
@@ -76,5 +85,8 @@ Also can have signal handlers
     Float
     Rational
     Complex
+
+## Others
+
     Regexp
     Range
